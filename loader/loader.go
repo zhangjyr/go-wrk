@@ -187,7 +187,6 @@ func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string
 		}
 		fmt.Println("An error occured doing request", err)
 	}
-	item.StatusCode = resp.StatusCode
 
 	if resp == nil {
 		fmt.Println("empty response")
@@ -198,6 +197,8 @@ func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string
 			resp.Body.Close()
 		}
 	}()
+	item.StatusCode = resp.StatusCode
+	
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Println("An error occured reading body", err)

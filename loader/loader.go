@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tsliwowicz/go-wrk/util"
+	"github.com/zhangjyr/go-wrk/util"
 )
 
 const (
@@ -37,6 +37,18 @@ type LoadCfg struct {
 	clientKey          string
 	caCert             string
 	http2              bool
+	hold               chan struct{}
+}
+
+type RequesterItem struct {
+	Time           time.Time
+	StatusCode     int
+	ResponseTime   time.Duration
+}
+
+func (r *RequesterItem) String() string {
+	return fmt.Sprintf("%f,%d,%f", float64(r.Time.Unix()) + float64(r.Time.Nanosecond()) / 1e9,
+		r.StatusCode, r.ResponseTime.Seconds())
 }
 
 // RequesterStats used for colelcting aggregate statistics
@@ -47,6 +59,7 @@ type RequesterStats struct {
 	MaxRequestTime time.Duration
 	NumRequests    int
 	NumErrs        int
+	Items          []*RequesterItem
 }
 
 func NewLoadCfg(duration int, //seconds
@@ -66,8 +79,37 @@ func NewLoadCfg(duration int, //seconds
 	caCert string,
 	http2 bool) (rt *LoadCfg) {
 	rt = &LoadCfg{duration, goroutines, testUrl, reqBody, method, host, header, statsAggregator, timeoutms,
-		allowRedirects, disableCompression, disableKeepAlive, 0, clientCert, clientKey, caCert, http2}
+		allowRedirects, disableCompression, disableKeepAlive, 0, clientCert, clientKey, caCert, http2, make(chan struct{}) }
+	close(rt.hold)
 	return
+}
+
+func (load *LoadCfg) Hold() {
+	select {
+	case <- load.hold:
+		// If stopped, start
+		load.hold = make(chan struct{})
+	default:
+		// Pass to avoid hold twice
+	}
+}
+
+func (load *LoadCfg) IsHold() bool {
+	select {
+	case <- load.hold:
+		return false
+	default:
+		return true
+	}
+}
+
+func (load *LoadCfg) Resume() {
+	select {
+	case <- load.hold:
+		// Closed? Do nothing
+	default:
+		close(load.hold)
+	}
 }
 
 func escapeUrlStr(in string) string {
@@ -101,9 +143,8 @@ func escapeUrlStr(in string) string {
 
 //DoRequest single request implementation. Returns the size of the response and its duration
 //On error - returns -1 on both
-func DoRequest(httpClient *http.Client, header map[string]string, method, host, loadUrl, reqBody string) (respSize int, duration time.Duration) {
+func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string, method, host, loadUrl, reqBody string) (respSize int, item *RequesterItem) {
 	respSize = -1
-	duration = -1
 
 	loadUrl = escapeUrlStr(loadUrl)
 
@@ -122,12 +163,19 @@ func DoRequest(httpClient *http.Client, header map[string]string, method, host, 
 		req.Header.Add(hk, hv)
 	}
 
-	req.Header.Add("User-Agent", USER_AGENT)
+	// req.Header.Add("User-Agent", USER_AGENT)
 	if host != "" {
 		req.Host = host
 	}
 	start := time.Now()
+	item = &RequesterItem{
+		Time: start,
+	}
+	<-load.hold    // check hold
+
 	resp, err := httpClient.Do(req)
+	item.ResponseTime = time.Since(start)
+	item.StatusCode = 500
 	if err != nil {
 		fmt.Println("redirect?")
 		//this is a bit weird. When redirection is prevented, a url.Error is retuned. This creates an issue to distinguish
@@ -139,6 +187,8 @@ func DoRequest(httpClient *http.Client, header map[string]string, method, host, 
 		}
 		fmt.Println("An error occured doing request", err)
 	}
+	item.StatusCode = resp.StatusCode
+
 	if resp == nil {
 		fmt.Println("empty response")
 		return
@@ -153,10 +203,10 @@ func DoRequest(httpClient *http.Client, header map[string]string, method, host, 
 		fmt.Println("An error occured reading body", err)
 	}
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		duration = time.Since(start)
+		// duration = time.Since(start)
 		respSize = len(body) + int(util.EstimateHttpHeadersSize(resp.Header))
 	} else if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
-		duration = time.Since(start)
+		// duration = time.Since(start)
 		respSize = int(resp.ContentLength) + int(util.EstimateHttpHeadersSize(resp.Header))
 	} else {
 		fmt.Println("received status code", resp.StatusCode, "from", resp.Header, "content", string(body), req)
@@ -167,8 +217,11 @@ func DoRequest(httpClient *http.Client, header map[string]string, method, host, 
 
 //Requester a go function for repeatedly making requests and aggregating statistics as long as required
 //When it is done, it sends the results using the statsAggregator channel
-func (cfg *LoadCfg) RunSingleLoadSession() {
-	stats := &RequesterStats{MinRequestTime: time.Minute}
+func (cfg *LoadCfg) RunSingleLoadSession(id string) {
+	stats := &RequesterStats{
+		MinRequestTime: time.Minute,
+		Items: make([]*RequesterItem, 0, 10000),
+	}
 	start := time.Now()
 
 	httpClient, err := client(cfg.disableCompression, cfg.disableKeepAlive, cfg.timeoutms, cfg.allowRedirects, cfg.clientCert, cfg.clientKey, cfg.caCert, cfg.http2)
@@ -176,17 +229,25 @@ func (cfg *LoadCfg) RunSingleLoadSession() {
 		log.Fatal(err)
 	}
 
+	seq := 0
 	for time.Since(start).Seconds() <= float64(cfg.duration) && atomic.LoadInt32(&cfg.interrupted) == 0 {
-		respSize, reqDur := DoRequest(httpClient, cfg.header, cfg.method, cfg.host, cfg.testUrl, cfg.reqBody)
+		respSize, item := cfg.DoRequest(httpClient, cfg.header, cfg.method, cfg.host, cfg.testUrl, cfg.reqBody)
 		if respSize > 0 {
 			stats.TotRespSize += int64(respSize)
-			stats.TotDuration += reqDur
-			stats.MaxRequestTime = util.MaxDuration(reqDur, stats.MaxRequestTime)
-			stats.MinRequestTime = util.MinDuration(reqDur, stats.MinRequestTime)
+			stats.TotDuration += item.ResponseTime
+			stats.MaxRequestTime = util.MaxDuration(item.ResponseTime, stats.MaxRequestTime)
+			stats.MinRequestTime = util.MinDuration(item.ResponseTime, stats.MinRequestTime)
 			stats.NumRequests++
 		} else {
 			stats.NumErrs++
 		}
+		if item != nil {
+			stats.Items = append(stats.Items, item)
+			if item.ResponseTime > 1 * time.Second {
+				log.Printf("Detected long request: %s_%d", id, seq)
+			}
+		}
+		seq++
 	}
 	cfg.statsAggregator <- stats
 }

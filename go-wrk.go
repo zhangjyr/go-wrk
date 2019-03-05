@@ -6,12 +6,13 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"log"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/tsliwowicz/go-wrk/loader"
-	"github.com/tsliwowicz/go-wrk/util"
+	"github.com/zhangjyr/go-wrk/loader"
+	"github.com/zhangjyr/go-wrk/util"
 )
 
 const APP_VERSION = "0.1"
@@ -37,6 +38,7 @@ var clientCert string
 var clientKey string
 var caCert string
 var http2 bool
+var datafile string
 
 func init() {
 	flag.BoolVar(&versionFlag, "v", false, "Print version details")
@@ -56,6 +58,7 @@ func init() {
 	flag.StringVar(&clientKey, "key", "", "Private key file name (SSL/TLS")
 	flag.StringVar(&caCert, "ca", "", "CA file to verify peer against (SSL/TLS)")
 	flag.BoolVar(&http2, "http", true, "Use HTTP/2")
+	flag.StringVar(&datafile, "o", "", "Path to output raw data")
 }
 
 //printDefaults a nicer format for the defaults
@@ -127,11 +130,27 @@ func main() {
 		allowRedirectsFlag, disableCompression, disableKeepAlive, clientCert, clientKey, caCert, http2)
 
 	for i := 0; i < goroutines; i++ {
-		go loadGen.RunSingleLoadSession()
+		go loadGen.RunSingleLoadSession(fmt.Sprintf("Con_%d", i))
 	}
 
-	responders := 0
+	// Wait for end
+	wait(sigChan, statsAggregator, loadGen)
+}
+
+func wait(sigChan chan os.Signal, statsAggregator chan *loader.RequesterStats, loadGen *loader.LoadCfg) {
+	var responders int
 	aggStats := loader.RequesterStats{MinRequestTime: time.Minute}
+	// for responders < totalRoutings {
+	var file *os.File
+	var err error
+	if len(datafile) > 0 {
+		file, err = os.OpenFile(datafile, os.O_CREATE|os.O_WRONLY, 0660)
+		if err != nil {
+			log.Printf("Warning: failed to open data file. Error: %s.", err.Error())
+		} else {
+			defer file.Close()
+		}
+	}
 
 	for responders < goroutines {
 		select {
@@ -146,6 +165,12 @@ func main() {
 			aggStats.MaxRequestTime = util.MaxDuration(aggStats.MaxRequestTime, stats.MaxRequestTime)
 			aggStats.MinRequestTime = util.MinDuration(aggStats.MinRequestTime, stats.MinRequestTime)
 			responders++
+			if file != nil {
+				for _, item := range stats.Items {
+					file.WriteString(item.String())
+					file.WriteString("\n")
+				}
+			}
 		}
 	}
 
@@ -164,5 +189,4 @@ func main() {
 	fmt.Printf("Fastest Request:\t%v\n", aggStats.MinRequestTime)
 	fmt.Printf("Slowest Request:\t%v\n", aggStats.MaxRequestTime)
 	fmt.Printf("Number of Errors:\t%v\n", aggStats.NumErrs)
-
 }

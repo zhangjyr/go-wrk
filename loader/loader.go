@@ -243,9 +243,9 @@ func (cfg *LoadCfg) RunSingleLoadSession(id string) {
 		}
 		if item != nil {
 			stats.Items = append(stats.Items, item)
-			if item.ResponseTime > 1 * time.Second {
-				log.Printf("Detected long request: %s_%d", id, seq)
-			}
+			// if item.ResponseTime > 1 * time.Second {
+			// 	log.Printf("Detected long request: %s_%d", id, seq)
+			// }
 		}
 		seq++
 	}

@@ -130,7 +130,7 @@ func main() {
 		allowRedirectsFlag, disableCompression, disableKeepAlive, clientCert, clientKey, caCert, http2)
 
 	for i := 0; i < goroutines; i++ {
-		go loadGen.RunSingleLoadSession(fmt.Sprintf("Con_%d", i))
+		go loadGen.RunSingleLoadSession(i, fmt.Sprintf("Con_%d", i))
 	}
 
 	// Wait for end

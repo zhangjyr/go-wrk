@@ -33,6 +33,7 @@ type LoadCfg struct {
 	disableCompression bool
 	disableKeepAlive   bool
 	interrupted        int32
+	threshold          int32
 	clientCert         string
 	clientKey          string
 	caCert             string
@@ -78,8 +79,11 @@ func NewLoadCfg(duration int, //seconds
 	clientKey string,
 	caCert string,
 	http2 bool) (rt *LoadCfg) {
-	rt = &LoadCfg{duration, goroutines, testUrl, reqBody, method, host, header, statsAggregator, timeoutms,
-		allowRedirects, disableCompression, disableKeepAlive, 0, clientCert, clientKey, caCert, http2, make(chan struct{}) }
+	rt = &LoadCfg{
+		duration, goroutines, testUrl, reqBody, method, host, header, statsAggregator, timeoutms,
+		allowRedirects, disableCompression, disableKeepAlive, 0, int32(goroutines), clientCert, clientKey, caCert,
+		http2, make(chan struct{}),
+	}
 	close(rt.hold)
 	return
 }
@@ -171,7 +175,9 @@ func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string
 	item = &RequesterItem{
 		Time: start,
 	}
-	<-load.hold    // check hold
+	if load.testUrl == loadUrl {
+		<-load.hold    // check hold
+	}
 
 	resp, err := httpClient.Do(req)
 	item.ResponseTime = time.Since(start)
@@ -198,7 +204,7 @@ func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string
 		}
 	}()
 	item.StatusCode = resp.StatusCode
-	
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Println("An error occured reading body", err)
@@ -218,41 +224,60 @@ func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string
 
 //Requester a go function for repeatedly making requests and aggregating statistics as long as required
 //When it is done, it sends the results using the statsAggregator channel
-func (cfg *LoadCfg) RunSingleLoadSession(id string) {
+func (load *LoadCfg) RunSingleLoadSession(mark int, id string) {
 	stats := &RequesterStats{
 		MinRequestTime: time.Minute,
 		Items: make([]*RequesterItem, 0, 10000),
 	}
 	start := time.Now()
 
-	httpClient, err := client(cfg.disableCompression, cfg.disableKeepAlive, cfg.timeoutms, cfg.allowRedirects, cfg.clientCert, cfg.clientKey, cfg.caCert, cfg.http2)
+	httpClient, err := client(load.disableCompression, load.disableKeepAlive, load.timeoutms, load.allowRedirects, load.clientCert, load.clientKey, load.caCert, load.http2)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	seq := 0
-	for time.Since(start).Seconds() <= float64(cfg.duration) && atomic.LoadInt32(&cfg.interrupted) == 0 {
-		respSize, item := cfg.DoRequest(httpClient, cfg.header, cfg.method, cfg.host, cfg.testUrl, cfg.reqBody)
-		if respSize > 0 {
-			stats.TotRespSize += int64(respSize)
-			stats.TotDuration += item.ResponseTime
-			stats.MaxRequestTime = util.MaxDuration(item.ResponseTime, stats.MaxRequestTime)
-			stats.MinRequestTime = util.MinDuration(item.ResponseTime, stats.MinRequestTime)
-			stats.NumRequests++
+	for time.Since(start).Seconds() <= float64(load.duration) && atomic.LoadInt32(&load.interrupted) == 0 {
+		if mark < int(atomic.LoadInt32(&load.threshold)) {
+			respSize, item := load.DoRequest(httpClient, load.header, load.method, load.host, load.testUrl, load.reqBody)
+			if respSize > 0 {
+				stats.TotRespSize += int64(respSize)
+				stats.TotDuration += item.ResponseTime
+				stats.MaxRequestTime = util.MaxDuration(item.ResponseTime, stats.MaxRequestTime)
+				stats.MinRequestTime = util.MinDuration(item.ResponseTime, stats.MinRequestTime)
+				stats.NumRequests++
+			} else {
+				stats.NumErrs++
+			}
+			if item != nil {
+				stats.Items = append(stats.Items, item)
+				// if item.ResponseTime > 1 * time.Second {
+				// 	log.Printf("Detected long request: %s_%d", id, seq)
+				// }
+			}
+			seq++
 		} else {
-			stats.NumErrs++
+			// Sleep 10ms to prevent excessive for loop
+			time.Sleep(10 * time.Millisecond)
 		}
-		if item != nil {
-			stats.Items = append(stats.Items, item)
-			// if item.ResponseTime > 1 * time.Second {
-			// 	log.Printf("Detected long request: %s_%d", id, seq)
-			// }
-		}
-		seq++
 	}
-	cfg.statsAggregator <- stats
+	load.statsAggregator <- stats
 }
 
-func (cfg *LoadCfg) Stop() {
-	atomic.StoreInt32(&cfg.interrupted, 1)
+func (load *LoadCfg) Swap(testUrl string) string {
+	old := load.testUrl
+	load.testUrl = testUrl
+	return old
+}
+
+func (load *LoadCfg) Throttle(num int) {
+	atomic.StoreInt32(&load.threshold, int32(num))
+}
+
+func (load *LoadCfg) Unthrottle() {
+	atomic.StoreInt32(&load.threshold, int32(load.goroutines))
+}
+
+func (load *LoadCfg) Stop() {
+	atomic.StoreInt32(&load.interrupted, 1)
 }

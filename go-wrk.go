@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"log"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/zhangjyr/go-wrk/loader"
@@ -26,7 +25,6 @@ var testUrl string
 var method string = "GET"
 var host string
 var headerStr string
-var header map[string]string
 var statsAggregator chan *loader.RequesterStats
 var timeoutms int
 var allowRedirectsFlag bool = false
@@ -80,14 +78,6 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt)
 
 	flag.Parse() // Scan the arguments list
-	header = make(map[string]string)
-	if headerStr != "" {
-		headerPairs := strings.Split(headerStr, ";")
-		for _, hdr := range headerPairs {
-			hp := strings.Split(hdr, ":")
-			header[hp[0]] = hp[1]
-		}
-	}
 
 	if playbackFile != "<empty>" {
 		file, err := os.Open(playbackFile) // For read access.
@@ -126,7 +116,7 @@ func main() {
 		reqBody = string(data)
 	}
 
-	loadGen := loader.NewLoadCfg(duration, goroutines, testUrl, reqBody, method, host, header, statsAggregator, timeoutms,
+	loadGen := loader.NewLoadCfg(duration, goroutines, testUrl, reqBody, method, host, headerStr, statsAggregator, timeoutms,
 		allowRedirectsFlag, disableCompression, disableKeepAlive, clientCert, clientKey, caCert, http2)
 
 	for i := 0; i < goroutines; i++ {

@@ -2,6 +2,8 @@ package loader
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,26 +21,41 @@ const (
 	USER_AGENT = "go-wrk"
 )
 
-type LoadCfg struct {
-	duration           int //seconds
-	goroutines         int
-	testUrl            string
-	reqBody            string
-	method             string
-	host               string
-	header             map[string]string
-	statsAggregator    chan *RequesterStats
-	timeoutms          int
-	allowRedirects     bool
-	disableCompression bool
-	disableKeepAlive   bool
-	interrupted        int32
-	threshold          int32
-	clientCert         string
-	clientKey          string
-	caCert             string
-	http2              bool
-	hold               chan struct{}
+var (
+	ERR_THROTTLED_BELOW_ZERO = errors.New("Throttled below zero.")
+	ERR_THROTTLED_ABOVE_LIMIT = errors.New("Throttled above limit.")
+)
+
+type RequestCfg struct {
+	TestUrl     string
+	ReqBody     string
+	Method      string
+	Host        string
+	RawHeader   string
+	Header      map[string]string
+	Hash        [sha256.Size]byte
+}
+
+func (req *RequestCfg) String() string {
+	return fmt.Sprintf("%s %s\r\nHOST: %s\r\n%s\r\n%s", req.Method, req.TestUrl, req.Host, req.RawHeader, req.ReqBody)
+}
+
+func (req *RequestCfg) Sign() {
+	req.Header = make(map[string]string)
+	if req.RawHeader != "" {
+		headerPairs := strings.Split(req.RawHeader, ";")
+		for _, hdr := range headerPairs {
+			hp := strings.Split(hdr, ":")
+			req.Header[hp[0]] = hp[1]
+		}
+	}
+	req.Hash = sha256.Sum256([]byte(req.String()))
+}
+
+func (req RequestCfg) Copy() *RequestCfg {
+	req.Header = nil
+	req.Hash = [sha256.Size]byte{}
+	return &req
 }
 
 type RequesterItem struct {
@@ -63,13 +80,31 @@ type RequesterStats struct {
 	Items          []*RequesterItem
 }
 
+type LoadCfg struct {
+	duration           int //seconds
+	goroutines         int
+	request            *RequestCfg
+	statsAggregator    chan *RequesterStats
+	timeoutms          int
+	allowRedirects     bool
+	disableCompression bool
+	disableKeepAlive   bool
+	interrupted        int32
+	threshold          int32
+	clientCert         string
+	clientKey          string
+	caCert             string
+	http2              bool
+	hold               chan struct{}
+}
+
 func NewLoadCfg(duration int, //seconds
 	goroutines int,
 	testUrl string,
 	reqBody string,
 	method string,
 	host string,
-	header map[string]string,
+	header string,
 	statsAggregator chan *RequesterStats,
 	timeoutms int,
 	allowRedirects bool,
@@ -79,11 +114,16 @@ func NewLoadCfg(duration int, //seconds
 	clientKey string,
 	caCert string,
 	http2 bool) (rt *LoadCfg) {
-	rt = &LoadCfg{
-		duration, goroutines, testUrl, reqBody, method, host, header, statsAggregator, timeoutms,
-		allowRedirects, disableCompression, disableKeepAlive, 0, int32(goroutines), clientCert, clientKey, caCert,
-		http2, make(chan struct{}),
+	request := &RequestCfg {
+		TestUrl: testUrl,
+		ReqBody: reqBody,
+		Method: method,
+		Host: host,
+		RawHeader: header,
 	}
+	rt = &LoadCfg{ duration, goroutines, request, statsAggregator, timeoutms, allowRedirects, disableCompression,
+		disableKeepAlive, 0, int32(goroutines), clientCert, clientKey, caCert, http2, make(chan struct{}) }
+	rt.request.Sign()
 	close(rt.hold)
 	return
 }
@@ -147,35 +187,35 @@ func escapeUrlStr(in string) string {
 
 //DoRequest single request implementation. Returns the size of the response and its duration
 //On error - returns -1 on both
-func (load *LoadCfg) DoRequest(httpClient *http.Client, header map[string]string, method, host, loadUrl, reqBody string) (respSize int, item *RequesterItem) {
+func (load *LoadCfg) DoRequest(httpClient *http.Client, reqCfg *RequestCfg) (respSize int, item *RequesterItem) {
 	respSize = -1
 
-	loadUrl = escapeUrlStr(loadUrl)
+	loadUrl := escapeUrlStr(reqCfg.TestUrl)
 
 	var buf io.Reader
-	if len(reqBody) > 0 {
-		buf = bytes.NewBufferString(reqBody)
+	if len(reqCfg.ReqBody) > 0 {
+		buf = bytes.NewBufferString(reqCfg.ReqBody)
 	}
 
-	req, err := http.NewRequest(method, loadUrl, buf)
+	req, err := http.NewRequest(reqCfg.Method, loadUrl, buf)
 	if err != nil {
 		fmt.Println("An error occured doing request", err)
 		return
 	}
 
-	for hk, hv := range header {
+	for hk, hv := range reqCfg.Header {
 		req.Header.Add(hk, hv)
 	}
 
 	// req.Header.Add("User-Agent", USER_AGENT)
-	if host != "" {
-		req.Host = host
+	if reqCfg.Host != "" {
+		req.Host = reqCfg.Host
 	}
 	start := time.Now()
 	item = &RequesterItem{
 		Time: start,
 	}
-	if load.testUrl == loadUrl {
+	if load.request.Hash == reqCfg.Hash {
 		<-load.hold    // check hold
 	}
 
@@ -239,7 +279,7 @@ func (load *LoadCfg) RunSingleLoadSession(mark int, id string) {
 	seq := 0
 	for time.Since(start).Seconds() <= float64(load.duration) && atomic.LoadInt32(&load.interrupted) == 0 {
 		if mark < int(atomic.LoadInt32(&load.threshold)) {
-			respSize, item := load.DoRequest(httpClient, load.header, load.method, load.host, load.testUrl, load.reqBody)
+			respSize, item := load.DoRequest(httpClient, load.request)
 			if respSize > 0 {
 				stats.TotRespSize += int64(respSize)
 				stats.TotDuration += item.ResponseTime
@@ -265,17 +305,71 @@ func (load *LoadCfg) RunSingleLoadSession(mark int, id string) {
 }
 
 func (load *LoadCfg) Swap(testUrl string) string {
-	old := load.testUrl
-	load.testUrl = testUrl
+	return load.SwapRequest(&testUrl, nil, nil, nil, nil).TestUrl
+}
+
+func (load *LoadCfg) SwapHeader(header string) map[string]string {
+	return load.SwapRequest(nil, nil, nil, nil, &header).Header
+}
+
+func (load *LoadCfg) SwapBody(reqBody string) string {
+	return load.SwapRequest(nil, &reqBody, nil, nil, nil).ReqBody
+}
+
+func (load *LoadCfg) SwapRequest(testUrl *string, reqBody *string, method *string, host *string, header *string) *RequestCfg {
+	old := load.request
+	new := old.Copy()
+	if testUrl != nil {
+		new.TestUrl = *testUrl
+	}
+	if reqBody != nil {
+		new.ReqBody = *reqBody
+	}
+	if method != nil {
+		new.Method = *method
+	}
+	if host != nil {
+		new.Host = *host
+	}
+	if header != nil {
+		new.RawHeader = *header
+	}
+	new.Sign()
+	load.request = new
 	return old
 }
+
 
 func (load *LoadCfg) Throttle(num int) {
 	atomic.StoreInt32(&load.threshold, int32(num))
 }
 
+func (load *LoadCfg) ThrottleUp(num int) error {
+	new := atomic.AddInt32(&load.threshold, int32(num))
+	if new > int32(load.goroutines) {
+		atomic.CompareAndSwapInt32(&load.threshold, new, int32(load.goroutines))
+		return ERR_THROTTLED_ABOVE_LIMIT
+	} else {
+		return nil
+	}
+}
+
+func (load *LoadCfg) ThrottleDown(num int) error {
+	new := atomic.AddInt32(&load.threshold, int32(-num))
+	if new < 0 {
+		atomic.CompareAndSwapInt32(&load.threshold, new, 0)
+		return ERR_THROTTLED_BELOW_ZERO
+	} else {
+		return nil
+	}
+}
+
 func (load *LoadCfg) Unthrottle() {
 	atomic.StoreInt32(&load.threshold, int32(load.goroutines))
+}
+
+func (load *LoadCfg) Threshhold() int32 {
+	return atomic.LoadInt32(&load.threshold)
 }
 
 func (load *LoadCfg) Stop() {

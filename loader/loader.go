@@ -305,34 +305,34 @@ func (load *LoadCfg) RunSingleLoadSession(mark int, id string) {
 }
 
 func (load *LoadCfg) Swap(testUrl string) string {
-	return load.SwapRequest(&testUrl, nil, nil, nil, nil).TestUrl
+	return load.SwapRequest(testUrl, "", "", "", "",).TestUrl
 }
 
-func (load *LoadCfg) SwapHeader(header string) map[string]string {
-	return load.SwapRequest(nil, nil, nil, nil, &header).Header
+func (load *LoadCfg) SwapHeader(header string) string {
+	return load.SwapRequest("", "", "", "", header).RawHeader
 }
 
 func (load *LoadCfg) SwapBody(reqBody string) string {
-	return load.SwapRequest(nil, &reqBody, nil, nil, nil).ReqBody
+	return load.SwapRequest("", reqBody, "", "", "").ReqBody
 }
 
-func (load *LoadCfg) SwapRequest(testUrl *string, reqBody *string, method *string, host *string, header *string) *RequestCfg {
+func (load *LoadCfg) SwapRequest(testUrl string, reqBody string, method string, host string, header string) *RequestCfg {
 	old := load.request
 	new := old.Copy()
-	if testUrl != nil {
-		new.TestUrl = *testUrl
+	if len(testUrl) != 0 {
+		new.TestUrl = testUrl
 	}
-	if reqBody != nil {
-		new.ReqBody = *reqBody
+	if len(reqBody) != 0 {
+		new.ReqBody = reqBody
 	}
-	if method != nil {
-		new.Method = *method
+	if len(method) != 0 {
+		new.Method = method
 	}
-	if host != nil {
-		new.Host = *host
+	if len(host) != 0 {
+		new.Host = host
 	}
-	if header != nil {
-		new.RawHeader = *header
+	if len(header) != 0 {
+		new.RawHeader = header
 	}
 	new.Sign()
 	load.request = new
